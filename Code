@@ -1,0 +1,364 @@
+// ---------------------------------------------------------------
+// SmartEnergyMonitor - FINAL (Batch offline upload)
+// ESP32 + PZEM004T + WiFiManager + MQTT + SD Logging (batch upload)
+// LED Behaviour added:
+//   - WiFi Connected → LED ON
+//   - WiFi Disconnected → Slow Blink (800ms)
+//   - WiFi Not Available / Connecting → Fast Blink (200ms)
+// ---------------------------------------------------------------
+
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <PZEM004Tv30.h>
+#include <time.h>
+
+// ---------------- LED PIN ----------------
+#define LED_PIN 2
+unsigned long lastLedToggle = 0;
+bool ledState = false;
+
+// ---------------- LED handling ----------------
+void updateLED() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // WiFi connected → LED ON
+    digitalWrite(LED_PIN, HIGH);
+    return;
+  }
+
+  // If WiFi disconnected → blink slow
+  unsigned long interval = 800;
+
+  // If WiFi not available / trying to connect → fast blink
+  if (WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_NO_SSID_AVAIL) {
+    interval = 200;
+  }
+
+  if (millis() - lastLedToggle >= interval) {
+    lastLedToggle = millis();
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+  }
+}
+
+// ---------------- PZEM PINS ----------------
+#define PZEM_RX_PIN 16
+#define PZEM_TX_PIN 17
+
+// ---------------- SD PINS ----------------
+#define SD_CS   5
+#define SD_SCK 18
+#define SD_MOSI 23
+#define SD_MISO 19
+
+// ---------------- RESET BUTTON (PIN 14) ----------------
+#define RESET_BUTTON_PIN 14
+unsigned long buttonDown = 0;
+bool buttonPressed = false;
+
+// ---------------- MQTT CONFIG ----------------
+#define MQTT_HOST  "test.mosquitto.org"
+#define MQTT_PORT  1883   // NON TLS
+#define MQTT_USER  ""
+#define MQTT_PASS  ""
+
+// Topics
+#define TOPIC_DATA       "devices/esp32_meter_001/readings"
+#define TOPIC_STATUS     "devices/esp32_meter_001/status"
+#define TOPIC_COMMAND    "devices/esp32_meter_001/command"
+#define TOPIC_OFFLINE    "devices/esp32_meter_001/offline_batch"
+
+// ---------------- INTERVALS ----------------
+const unsigned long READ_INTERVAL_MS = 1000;
+const unsigned long UPLOAD_INTERVAL_MS = 1000;
+const unsigned long MQTT_RETRY_MS = 2000;
+
+// ---------------- GLOBALS ----------------
+PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+Preferences prefs;
+WebServer server(80);
+
+bool sdAvailable = false;
+unsigned long lastReadMillis = 0;
+unsigned long lastUploadMillis = 0;
+unsigned long lastMqttAttempt = 0;
+bool offlineLoggingStarted = false;
+
+// ---------------- CURRENT DATA ----------------
+struct Reading {
+  float voltage;
+  float current;
+  float power;
+  float energyKWh;
+  float frequency;
+  float pf;
+  unsigned long ts;
+  bool valid;
+} lastRead;
+
+// ---------------- NTP / timezone ----------------
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+
+String nowStr() {
+  time_t now;
+  time(&now);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// ---------------- Append to SD ----------------
+void appendToSD(const String &file, const String &line) {
+  if (!sdAvailable) return;
+  File f = SD.open(file, FILE_APPEND);
+  if (!f) {
+    Serial.print("Failed to open "); Serial.println(file);
+    sdAvailable = false;
+    return;
+  }
+  f.println(line);
+  f.close();
+}
+
+// ---------------- SD Init ----------------
+bool initSD() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("⚠ SD Card NOT found — offline logging disabled");
+    return false;
+  }
+  Serial.println("✔ SD Card detected — logging started");
+
+  if (!SD.exists("/offline.csv")) {
+    File f = SD.open("/offline.csv", FILE_WRITE);
+    if (f) f.close();
+  }
+  return true;
+}
+
+// ---------------- Reset button handling ----------------
+void checkResetButton() {
+  bool pressed = digitalRead(RESET_BUTTON_PIN) == LOW;
+
+  if (pressed && !buttonPressed) {
+    buttonPressed = true;
+    buttonDown = millis();
+  }
+
+  if (!pressed && buttonPressed) {
+    unsigned long held = millis() - buttonDown;
+    buttonPressed = false;
+
+    if (held > 3000) {
+      Serial.println("LONG PRESS → Clearing WiFi Credentials...");
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(2000);
+      ESP.restart();
+    } else {
+      Serial.println("SHORT PRESS → Resetting PZEM Energy");
+      pzem.resetEnergy();
+      if (mqttClient.connected()) mqttClient.publish(TOPIC_STATUS, "energy_reset");
+    }
+  }
+}
+
+// ---------------- PZEM read ----------------
+void readPZEM() {
+  Reading r;
+  r.voltage = pzem.voltage();
+  r.current = pzem.current();
+  r.power   = pzem.power();
+  r.energyKWh = pzem.energy() / 1000.0;
+  r.frequency = pzem.frequency();
+  r.pf = pzem.pf();
+  r.ts = millis();
+  r.valid = !(isnan(r.voltage) && isnan(r.current));
+  lastRead = r;
+}
+
+// ---------------- MQTT callback ----------------
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String cmd;
+  for (unsigned int i = 0; i < len; i++) cmd += (char)payload[i];
+
+  if (cmd == "reset_energy") {
+    pzem.resetEnergy();
+    if (mqttClient.connected()) mqttClient.publish(TOPIC_STATUS, "energy_reset");
+  }
+}
+
+// ---------------- Batch offline publish ----------------
+void publishOfflineAsBatch() {
+  if (!sdAvailable) return;
+  if (!SD.exists("/offline.csv")) return;
+
+  File f = SD.open("/offline.csv", FILE_READ);
+  if (!f) return;
+
+  String batch;
+  batch.reserve(8192);
+  batch += "{\"offline_batch\":[";
+
+  unsigned long count = 0;
+  bool first = true;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (!first) batch += ',';
+    first = false;
+    batch += line;
+    count++;
+  }
+
+  batch += "],\"count\":";
+  batch += String(count);
+  batch += "}";
+
+  f.close();
+
+  if (count == 0) return;
+
+  if (mqttClient.connected()) {
+    if (mqttClient.publish(TOPIC_OFFLINE, batch.c_str())) {
+      if (SD.exists("/offline.csv")) {
+        SD.remove("/offline.csv");
+        File nf = SD.open("/offline.csv", FILE_WRITE);
+        if (nf) nf.close();
+      }
+    }
+  }
+}
+
+// ---------------- Try MQTT once ----------------
+bool tryConnectMQTTOnce() {
+  if (mqttClient.connected()) return true;
+
+  bool connected = false;
+  if (strlen(MQTT_USER) > 0)
+    connected = mqttClient.connect("esp32_meter_001", MQTT_USER, MQTT_PASS);
+  else
+    connected = mqttClient.connect("esp32_meter_001");
+
+  if (connected) {
+    mqttClient.publish(TOPIC_STATUS, "online", true);
+    mqttClient.subscribe(TOPIC_COMMAND);
+    publishOfflineAsBatch();
+    offlineLoggingStarted = false;
+    return true;
+  }
+  return false;
+}
+
+// ---------------- Publish or save ----------------
+void publishData() {
+  StaticJsonDocument<256> j;
+
+  if (!isnan(lastRead.voltage)) j["voltage"] = lastRead.voltage;
+  if (!isnan(lastRead.current)) j["current"] = lastRead.current;
+  if (!isnan(lastRead.power))   j["power"] = lastRead.power;
+  if (!isnan(lastRead.energyKWh)) j["energy"] = lastRead.energyKWh;
+  if (!isnan(lastRead.frequency)) j["freq"] = lastRead.frequency;
+  if (!isnan(lastRead.pf)) j["pf"] = lastRead.pf;
+
+  j["units"] = lastRead.energyKWh;
+  j["time"] = nowStr();
+
+  String out;
+  serializeJson(j, out);
+
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_DATA, out.c_str());
+    offlineLoggingStarted = false;
+  } else {
+    if (sdAvailable) {
+      appendToSD("/offline.csv", out);
+      if (!offlineLoggingStarted) offlineLoggingStarted = true;
+    }
+  }
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+
+  Serial2.begin(9600, SERIAL_8N1, PZEM_RX_PIN, PZEM_TX_PIN);
+
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000) {
+    if (time(nullptr) > 100000) break;
+    delay(200);
+  }
+
+  sdAvailable = initSD();
+
+  WiFiManager wm;
+  if (!wm.autoConnect("SEM_Config_AP")) ESP.restart();
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  tryConnectMQTTOnce();
+
+  server.on("/status", []() {
+    StaticJsonDocument<256> j;
+    j["voltage"] = lastRead.voltage;
+    j["current"] = lastRead.current;
+    j["power"]   = lastRead.power;
+    j["energy"]  = lastRead.energyKWh;
+    j["units"]   = lastRead.energyKWh;
+    j["time"]    = nowStr();
+    String out;
+    serializeJson(j, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.begin();
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  unsigned long now = millis();
+
+  updateLED();   // <<< LED behaviour added here
+
+  if (!mqttClient.connected()) {
+    if (now - lastMqttAttempt >= MQTT_RETRY_MS) {
+      lastMqttAttempt = now;
+      if (WiFi.status() == WL_CONNECTED) tryConnectMQTTOnce();
+    }
+  } else {
+    mqttClient.loop();
+  }
+
+  server.handleClient();
+  checkResetButton();
+
+  if (now - lastReadMillis >= READ_INTERVAL_MS) {
+    lastReadMillis = now;
+    readPZEM();
+  }
+
+  if (now - lastUploadMillis >= UPLOAD_INTERVAL_MS) {
+    lastUploadMillis = now;
+    publishData();
+  }
