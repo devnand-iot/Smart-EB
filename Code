@@ -39,51 +39,8 @@ void updateLED() {
     interval = 200;
   }
 
-  if (millis() - lastLedToggle >= interval) {
-    lastLedToggle = millis();
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState);
-  }
-}
+""""Parts Removed due to copyright""""
 
-// ---------------- PZEM PINS ----------------
-#define PZEM_RX_PIN 16
-#define PZEM_TX_PIN 17
-
-// ---------------- SD PINS ----------------
-#define SD_CS   5
-#define SD_SCK 18
-#define SD_MOSI 23
-#define SD_MISO 19
-
-// ---------------- RESET BUTTON (PIN 14) ----------------
-#define RESET_BUTTON_PIN 14
-unsigned long buttonDown = 0;
-bool buttonPressed = false;
-
-// ---------------- MQTT CONFIG ----------------
-#define MQTT_HOST  "test.mosquitto.org"
-#define MQTT_PORT  1883   // NON TLS
-#define MQTT_USER  ""
-#define MQTT_PASS  ""
-
-// Topics
-#define TOPIC_DATA       "devices/esp32_meter_001/readings"
-#define TOPIC_STATUS     "devices/esp32_meter_001/status"
-#define TOPIC_COMMAND    "devices/esp32_meter_001/command"
-#define TOPIC_OFFLINE    "devices/esp32_meter_001/offline_batch"
-
-// ---------------- INTERVALS ----------------
-const unsigned long READ_INTERVAL_MS = 1000;
-const unsigned long UPLOAD_INTERVAL_MS = 1000;
-const unsigned long MQTT_RETRY_MS = 2000;
-
-// ---------------- GLOBALS ----------------
-PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
-Preferences prefs;
-WebServer server(80);
 
 bool sdAvailable = false;
 unsigned long lastReadMillis = 0;
@@ -198,74 +155,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
   }
 }
 
-// ---------------- Batch offline publish ----------------
-void publishOfflineAsBatch() {
-  if (!sdAvailable) return;
-  if (!SD.exists("/offline.csv")) return;
 
-  File f = SD.open("/offline.csv", FILE_READ);
-  if (!f) return;
 
-  String batch;
-  batch.reserve(8192);
-  batch += "{\"offline_batch\":[";
-
-  unsigned long count = 0;
-  bool first = true;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    if (!first) batch += ',';
-    first = false;
-    batch += line;
-    count++;
-  }
-
-  batch += "],\"count\":";
-  batch += String(count);
-  batch += "}";
-
-  f.close();
-
-  if (count == 0) return;
-
-  if (mqttClient.connected()) {
-    if (mqttClient.publish(TOPIC_OFFLINE, batch.c_str())) {
-      if (SD.exists("/offline.csv")) {
-        SD.remove("/offline.csv");
-        File nf = SD.open("/offline.csv", FILE_WRITE);
-        if (nf) nf.close();
-      }
-    }
-  }
-}
-
-// ---------------- Try MQTT once ----------------
-bool tryConnectMQTTOnce() {
-  if (mqttClient.connected()) return true;
-
-  bool connected = false;
-  if (strlen(MQTT_USER) > 0)
-    connected = mqttClient.connect("esp32_meter_001", MQTT_USER, MQTT_PASS);
-  else
-    connected = mqttClient.connect("esp32_meter_001");
-
-  if (connected) {
-    mqttClient.publish(TOPIC_STATUS, "online", true);
-    mqttClient.subscribe(TOPIC_COMMAND);
-    publishOfflineAsBatch();
-    offlineLoggingStarted = false;
-    return true;
-  }
-  return false;
-}
-
-// ---------------- Publish or save ----------------
-void publishData() {
-  StaticJsonDocument<256> j;
+""""Parts Removed due to copyright""""
 
   if (!isnan(lastRead.voltage)) j["voltage"] = lastRead.voltage;
   if (!isnan(lastRead.current)) j["current"] = lastRead.current;
@@ -335,20 +227,11 @@ void setup() {
   server.begin();
 }
 
-// ---------------- Loop ----------------
-void loop() {
-  unsigned long now = millis();
 
-  updateLED();   // <<< LED behaviour added here
 
-  if (!mqttClient.connected()) {
-    if (now - lastMqttAttempt >= MQTT_RETRY_MS) {
-      lastMqttAttempt = now;
-      if (WiFi.status() == WL_CONNECTED) tryConnectMQTTOnce();
-    }
-  } else {
-    mqttClient.loop();
-  }
+""""Parts Removed due to copyright""""
+
+
 
   server.handleClient();
   checkResetButton();
